@@ -725,3 +725,435 @@ poe_batch <- run_poe_analysis_batch(
   file_stub = "PoE_GeneticNurture"
 )
 head(poe_batch$estimates)
+
+
+
+
+# =============================================================================
+# PART II: Mediation Analysis_Genetic nurture through parental phenotypes
+# Dependencies: lavaan, dplyr, tibble, writexl
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(lavaan)
+  library(dplyr)
+  library(tibble)
+  library(writexl)
+})
+
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+# -----------------------------------------------------------------------------#
+# Helper: clustering decision (avoid many-singletons warning)
+# -----------------------------------------------------------------------------#
+.med_use_cluster <- function(data, cluster_var) {
+  if (is.null(cluster_var) || !cluster_var %in% names(data)) {
+    return(list(use = FALSE, var = NULL, mean_size = NA_real_))
+  }
+  tab <- table(data[[cluster_var]])
+  mean_size <- mean(as.numeric(tab))
+  use_cluster <- any(tab > 1) && mean_size > 1.3
+  list(use = use_cluster, var = if (use_cluster) cluster_var else NULL, mean_size = mean_size)
+}
+
+# -----------------------------------------------------------------------------#
+# 1) MODEL SYNTAX
+# -----------------------------------------------------------------------------#
+#' Generate a two-mediator (mother & father) mediation model with PRS predictors
+#' - PRS ~~ PRS covariances (assortative mating)
+#' - mother_mediator ~~ father_mediator covariance (parental phenotype covariance-assortative mating)
+#' - Optional direct PRS -> outcome paths (c' terms)
+#' - Derived effects: mediated (T/NT × M/F), totals, directs, differences, proportions
+generate_mediation_model <- function(outcome_var,
+                                     mediator_vars = list(mother = "packyears_m_z",
+                                                          father = "packyears_f_z"),
+                                     prs_vars,
+                                     covariates_outcome  = c("age","sex.dummy"),
+                                     covariates_mediator = c("age","sex.dummy"),
+                                     include_direct = TRUE) {
+
+  tm  <- prs_vars$transmitted_mother
+  ntm <- prs_vars$nontransmitted_mother
+  tf  <- prs_vars$transmitted_father
+  ntf <- prs_vars$nontransmitted_father
+
+  m_m <- mediator_vars$mother
+  m_f <- mediator_vars$father
+
+  cov_y <- if (length(covariates_outcome))
+    paste(paste0("y", seq_along(covariates_outcome)), covariates_outcome, sep="*", collapse=" + ")
+  else " "
+
+  cov_m <- if (length(covariates_mediator))
+    paste(paste0("m", seq_along(covariates_mediator)), covariates_mediator, sep="*", collapse=" + ")
+  else " "
+
+  direct_rhs <- if (isTRUE(include_direct)) " + c_tm*%s + c_ntm*%s + c_tf*%s + c_ntf*%s" else ""
+
+  sprintf('
+# ===================== MEDIATION (parallel M & F) =====================
+
+# Mediators ~ own PRS (+ mediator covariates)
+%s ~ a_tm*%s  + a_ntm*%s %s
+%s ~ a_tf*%s  + a_ntf*%s %s
+
+# Outcome ~ mediators (+ optional direct PRS -> outcome) (+ outcome covariates)
+%s ~ b_m*%s + b_f*%s%s%s
+
+# ------------------- Covariances (assortative mating & phenotypes) -------------------
+# PRS <-> PRS
+%s ~~ %s
+%s ~~ %s
+%s ~~ %s
+%s ~~ %s
+%s ~~ %s
+%s ~~ %s
+# Parental phenotypes
+%s ~~ %s
+
+# ------------------- Derived effects -------------------
+# Indirect (mediated) effects
+mediated_T_m  := a_tm  * b_m
+mediated_NT_m := a_ntm * b_m
+mediated_T_f  := a_tf  * b_f
+mediated_NT_f := a_ntf * b_f
+
+# Differences in mediated effects (maternal vs paternal)
+diff_med_T  := mediated_T_m  - mediated_T_f
+diff_med_NT := mediated_NT_m - mediated_NT_f
+
+# Direct effects (c′)
+direct_T_m  := %s
+direct_NT_m := %s
+direct_T_f  := %s
+direct_NT_f := %s
+
+# Total effects (direct + indirect)
+total_T_m  := %s  + mediated_T_m
+total_NT_m := %s  + mediated_NT_m
+total_T_f  := %s  + mediated_T_f
+total_NT_f := %s  + mediated_NT_f
+
+# Proportion mediated (per PRS, per parent)
+prop_med_T_m  := mediated_T_m  / total_T_m
+prop_med_NT_m := mediated_NT_m / total_NT_m
+prop_med_T_f  := mediated_T_f  / total_T_f
+prop_med_NT_f := mediated_NT_f / total_NT_f
+
+# Differences in proportion mediated (maternal vs paternal)
+diff_prop_med_T  := prop_med_T_m  - prop_med_T_f
+diff_prop_med_NT := prop_med_NT_m - prop_med_NT_f
+',
+    # mediators
+    m_m, tm, ntm, if (nzchar(trimws(cov_m))) paste0(" + ", cov_m) else "",
+    m_f, tf, ntf, if (nzchar(trimws(cov_m))) paste0(" + ", cov_m) else "",
+    # outcome
+    outcome_var, m_m, m_f,
+    if (isTRUE(include_direct)) sprintf(direct_rhs, tm, ntm, tf, ntf) else "",
+    if (nzchar(trimws(cov_y))) paste0(" + ", cov_y) else "",
+    # PRS covariances
+    tm, ntm,
+    tf, ntf,
+    tm, tf,
+    tm, ntf,
+    ntm, tf,
+    ntm, ntf,
+    # parental phenotype covariance
+    m_m, m_f,
+    # direct effects labels (0 if not included)
+    if (isTRUE(include_direct)) "c_tm" else "0",
+    if (isTRUE(include_direct)) "c_ntm" else "0",
+    if (isTRUE(include_direct)) "c_tf" else "0",
+    if (isTRUE(include_direct)) "c_ntf" else "0",
+    # totals add direct label (or 0) + indirect
+    if (isTRUE(include_direct)) "c_tm" else "0",
+    if (isTRUE(include_direct)) "c_ntm" else "0",
+    if (isTRUE(include_direct)) "c_tf" else "0",
+    if (isTRUE(include_direct)) "c_ntf" else "0"
+  )
+}
+
+# -----------------------------------------------------------------------------#
+# 2) FITTING
+# -----------------------------------------------------------------------------#
+#' Fit mediation SEM
+#' @param method "bootstrap" (default) or "mlr"
+#' @param bootstrap number of bootstrap draws (if method="bootstrap")
+#' Note: For bootstrap, cluster is ignored with a message (lavaan limitation).
+fit_mediation_model <- function(model_syntax,
+                                data,
+                                cluster_var = NULL,
+                                method = "bootstrap",
+                                bootstrap = 1000) {
+  clu <- .med_use_cluster(data, cluster_var)
+
+  if (tolower(method) == "bootstrap") {
+    if (isTRUE(clu$use)) {
+      message("Mediation: Using bootstrap SEs; cluster is ignored (lavaan limitation). ",
+              "If clustered inference is critical, use method='mlr'.")
+    }
+    fit <- lavaan::sem(
+      model         = model_syntax,
+      data          = data,
+      missing       = "fiml",
+      fixed.x       = FALSE,
+      meanstructure = TRUE,
+      se            = "bootstrap",
+      bootstrap     = bootstrap
+    )
+  } else {
+    fit <- lavaan::sem(
+      model         = model_syntax,
+      data          = data,
+      missing       = "fiml",
+      estimator     = "MLR",
+      cluster       = if (isTRUE(clu$use)) clu$var else NULL,
+      fixed.x       = FALSE,
+      meanstructure = TRUE
+    )
+  }
+  attr(fit, "mean_cluster_size") <- clu$mean_size
+  fit
+}
+
+# -----------------------------------------------------------------------------#
+# 3) EXTRACTION
+# -----------------------------------------------------------------------------#
+extract_mediation_results <- function(fitted_model, outcome_var = NULL, boot_ci_type = "perc") {
+  pe <- parameterEstimates(fitted_model, standardized = TRUE, ci = TRUE, boot.ci.type = boot_ci_type)
+  if (is.null(outcome_var)) {
+    outs <- unique(pe$lhs[pe$op == "~"]); outcome_var <- tail(outs, 1)
+  }
+  reg_tab <- pe[pe$op == "~",
+                c("lhs","op","rhs","label","est","se","z","pvalue","ci.lower","ci.upper","std.all")]
+  rownames(reg_tab) <- NULL
+
+  # all derived (:=), e.g., mediated_*, totals, props, diffs
+  drv_tab <- pe[pe$op == ":=",
+                c("lhs","op","rhs","label","est","se","z","pvalue","ci.lower","ci.upper","std.all")]
+  rownames(drv_tab) <- NULL
+
+  r2 <- inspect(fitted_model, "r2")
+  r2_df <- if (length(r2)) tibble(variable = names(r2), r_squared = as.numeric(r2)) else tibble(variable = character(), r_squared = numeric())
+
+  fi_vec  <- fitMeasures(fitted_model, c("chisq","df","pvalue","cfi","tli","rmsea","srmr"))
+  fit_idx <- tibble::as_tibble_row(as.list(fi_vec))
+
+  list(regression = reg_tab, derived = drv_tab, r2 = r2_df, fit_indices = fit_idx, outcome = outcome_var)
+}
+
+# -----------------------------------------------------------------------------#
+# 4) TESTS (maternal vs paternal comparisons)
+# -----------------------------------------------------------------------------#
+perform_mediation_tests <- function(fitted_model) {
+  # mediated effects
+  w_T   <- lavTestWald(fitted_model, constraints = "mediated_T_m == mediated_T_f")
+  w_NT  <- lavTestWald(fitted_model, constraints = "mediated_NT_m == mediated_NT_f")
+  w_both <- lavTestWald(fitted_model, constraints = "
+    mediated_T_m == mediated_T_f
+    mediated_NT_m == mediated_NT_f
+  ")
+  # proportions
+  w_pT  <- lavTestWald(fitted_model, constraints = "prop_med_T_m == prop_med_T_f")
+  w_pNT <- lavTestWald(fitted_model, constraints = "prop_med_NT_m == prop_med_NT_f")
+  w_pboth <- lavTestWald(fitted_model, constraints = "
+    prop_med_T_m == prop_med_T_f
+    prop_med_NT_m == prop_med_NT_f
+  ")
+
+  as_row <- function(lbl, w) tibble(test = lbl,
+                                    chisq = as.numeric(w$stat),
+                                    df    = as.numeric(w$df),
+                                    p     = as.numeric(w$p.value))
+  list(
+    mediated_T_equal   = as_row("Mediated T: maternal = paternal", w_T),
+    mediated_NT_equal  = as_row("Mediated NT: maternal = paternal", w_NT),
+    mediated_joint     = as_row("Mediated T & NT: joint", w_both),
+    prop_T_equal       = as_row("Proportion T: maternal = paternal", w_pT),
+    prop_NT_equal      = as_row("Proportion NT: maternal = paternal", w_pNT),
+    prop_joint         = as_row("Proportion T & NT: joint", w_pboth)
+  )
+}
+
+# -----------------------------------------------------------------------------#
+# 5) PRESENTATION HELPERS
+# -----------------------------------------------------------------------------#
+format_results_table <- function(derived_df) {
+  # Order & select key effects
+  keep <- c(
+    "mediated_T_m","mediated_T_f","diff_med_T",
+    "mediated_NT_m","mediated_NT_f","diff_med_NT",
+    "prop_med_T_m","prop_med_T_f","diff_prop_med_T",
+    "prop_med_NT_m","prop_med_NT_f","diff_prop_med_NT",
+    "total_T_m","total_T_f","total_NT_m","total_NT_f",
+    "direct_T_m","direct_T_f","direct_NT_m","direct_NT_f"
+  )
+  out <- derived_df %>%
+    filter(label %in% keep) %>%
+    mutate(p_txt = ifelse(pvalue < 0.001, "<0.001", sprintf("%.3f", pvalue)),
+           ci_txt = paste0("[", sprintf("%.3f", ci.lower), ", ", sprintf("%.3f", ci.upper), "]")) %>%
+    transmute(Effect = label,
+              Estimate = sprintf("%.3f", est),
+              CI_95 = ci_txt,
+              P_value = p_txt,
+              Effect_Type = case_when(
+                grepl("^mediated_", label) ~ "Mediated Effects",
+                grepl("^diff_med", label)  ~ "Difference in Mediated Effects",
+                grepl("^prop_med_", label) ~ "Proportion Mediated",
+                grepl("^diff_prop_med", label) ~ "Difference in Proportion Mediated",
+                grepl("^total_", label)    ~ "Total Effects",
+                grepl("^direct_", label)   ~ "Direct Effects",
+                TRUE ~ "Other"
+              ))
+  out
+}
+
+summarize_tests_table <- function(tests_list) {
+  bind_rows(tests_list) %>%
+    mutate(p_txt = ifelse(p < 0.001, "<0.001", sprintf("%.3f", p))) %>%
+    transmute(Test = test, Chi_square = round(chisq, 3), df, P_value = p_txt,
+              Significant = p < 0.05)
+}
+
+# -----------------------------------------------------------------------------#
+# 6) RUNNERS
+# -----------------------------------------------------------------------------#
+# Single outcome
+run_mediation_analysis <- function(data,
+                                   outcome,                         # base name without _z (e.g., "packyears")
+                                   mediator_vars,                   # list(mother=..., father=...)
+                                   prs_vars,
+                                   covariates = c("age","sex.dummy"),
+                                   cluster_var = "nuclear_fam_id",
+                                   method = "bootstrap",
+                                   bootstrap = 1000,
+                                   include_direct = TRUE) {
+  outcome_std <- paste0(outcome, "_z")
+  ms <- generate_mediation_model(
+    outcome_var = outcome_std,
+    mediator_vars = mediator_vars,
+    prs_vars = prs_vars,
+    covariates_outcome  = covariates,
+    covariates_mediator = covariates,
+    include_direct = include_direct
+  )
+  fit <- fit_mediation_model(
+    model_syntax = ms,
+    data = data,
+    cluster_var = cluster_var,
+    method = method,
+    bootstrap = bootstrap
+  )
+  ext <- extract_mediation_results(fit, outcome_var = outcome_std)
+  tests <- perform_mediation_tests(fit)
+
+  list(
+    model = fit,
+    regression = ext$regression,
+    derived = ext$derived,
+    r2 = ext$r2,
+    fit_indices = ext$fit_indices,
+    results_table = format_results_table(ext$derived),
+    tests = tests,
+    tests_table = summarize_tests_table(tests),
+    syntax = ms
+  )
+}
+
+# Batch across multiple outcomes
+run_mediation_batch <- function(data,
+                                outcomes,              # vector of base names without _z
+                                mediator_map,          # named list: outcome -> list(mother=..., father=...)
+                                prs_vars,
+                                covariates = c("age","sex.dummy"),
+                                cluster_var = "nuclear_fam_id",
+                                method = "bootstrap",
+                                bootstrap = 1000,
+                                include_direct = TRUE,
+                                export = TRUE,
+                                output_dir = ".",
+                                file_stub = "Mediation_part2_results") {
+  all_reg <- list(); all_der <- list(); all_r2 <- list(); all_fit <- list(); all_tests <- list(); models <- list()
+
+  for (y in outcomes) {
+    outcome_std <- paste0(y, "_z")
+    meds <- mediator_map[[y]]
+    if (is.null(meds)) stop("No mediator mapping provided for outcome: ", y)
+
+    cat(sprintf("\n--- Mediation: %s via (%s, %s) ---\n", outcome_std, meds$mother, meds$father))
+    res <- run_mediation_analysis(
+      data = data,
+      outcome = y,
+      mediator_vars = meds,
+      prs_vars = prs_vars,
+      covariates = covariates,
+      cluster_var = cluster_var,
+      method = method,
+      bootstrap = bootstrap,
+      include_direct = include_direct
+    )
+    all_reg[[outcome_std]]  <- as_tibble(res$regression) %>% mutate(outcome = outcome_std)
+    all_der[[outcome_std]]  <- as_tibble(res$derived)    %>% mutate(outcome = outcome_std)
+    all_r2[[outcome_std]]   <- as_tibble(res$r2)         %>% mutate(outcome = outcome_std)
+    all_fit[[outcome_std]]  <- res$fit_indices           %>% mutate(outcome = outcome_std)
+    all_tests[[outcome_std]]<- res$tests_table           %>% mutate(outcome = outcome_std)
+    models[[outcome_std]]   <- list(model = res$model, syntax = res$syntax)
+  }
+
+  reg_all  <- bind_rows(all_reg) %>% relocate(outcome)
+  der_all  <- bind_rows(all_der) %>% relocate(outcome)
+  r2_all   <- bind_rows(all_r2)  %>% relocate(outcome)
+  fit_all  <- bind_rows(all_fit) %>% relocate(outcome)
+  test_all <- bind_rows(all_tests) %>% relocate(outcome)
+
+  if (export) {
+    if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+    writexl::write_xlsx(
+      list(
+        Regression = reg_all,
+        Indirects_And_Totals = der_all,
+        R2 = r2_all,
+        Fit_Indices = fit_all,
+        Tests = test_all
+      ),
+      file.path(output_dir, paste0(file_stub, ".xlsx"))
+    )
+    cat(sprintf("\nSaved mediation results to: %s\n", file.path(output_dir, paste0(file_stub, ".xlsx"))))
+  }
+
+  invisible(list(
+    regression = reg_all, derived = der_all, r2 = r2_all, fit = fit_all, tests = test_all, models = models
+  ))
+}
+
+############################################################
+# Define inputs
+prs_vars <- list(
+  transmitted_mother     = "CPD_PRS_T_MOTHER_res_Z",
+  nontransmitted_mother  = "CPD_PRS_NT_MOTHER_res_Z",
+  transmitted_father     = "CPD_PRS_T_FATHER_res_Z",
+  nontransmitted_father  = "CPD_PRS_NT_FATHER_res_Z"
+)
+
+# Single outcome (packyears)
+med_res <- run_mediation_analysis(
+  data = data_prepared,
+  outcome = "packyears",
+  mediator_vars = list(mother = "packyears_m_z", father = "packyears_f_z"),
+  prs_vars = prs_vars,
+  covariates = c("age","sex.dummy"),
+  cluster_var = "nuclear_fam_id",
+  method = "bootstrap",
+  bootstrap = 1000,
+  include_direct = TRUE
+)
+
+# Inspect
+summary(med_res$model, fit.measures = TRUE, standardized = TRUE, ci = TRUE)
+med_res$results_table         # nicely formatted derived effects
+med_res$tests_table           # Wald tests (maternal vs paternal)
+
+
+
+
+
