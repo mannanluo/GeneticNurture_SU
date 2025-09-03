@@ -1,0 +1,727 @@
+# ============================================================================
+# SEM-based Genetic Nurture Analysis Pipeline: Two-Step Approach
+# ============================================================================
+# 
+# Author: Mannan Luo(m.luo@umcg.nl)
+# Date: August 2025
+#
+# Description: A SEM-based pipeline for genetic nurture analysis:
+# Part 1: Parent-of-Origin Effects (PoE) Analysis - Maternal and paternal effects
+# Part 2: Mediation Analysis - Pathways through parental behaviors or family environmental factors
+#
+# ============================================================================
+
+# ============================================================================
+# 1. Setup and Packages
+# ============================================================================
+#' Setup R environment and load required packages
+#' @param lib_path Custom library path (optional)
+setup_environment <- function(lib_path = NULL) {
+  
+  # Clear environment
+  rm(list = ls(envir = .GlobalEnv), envir = .GlobalEnv)
+  
+  # Set custom library path if provided
+  if (!is.null(lib_path)) {
+    .libPaths(c(lib_path, .libPaths()))
+  }
+  
+  # Load required packages
+  library(dplyr)
+  library(tibble) 
+  library(data.table)
+  library(tidyverse)
+  library(lavaan)
+  library(psych)
+  library(writexl)
+  library(kableExtra)
+  
+  cat("Environment setup complete.\n\n")
+}
+
+# Run setup automatically
+# Option 1: Use default library path
+setup_environment()
+# Option 2: Use custom library path (uncomment and modify as needed)
+# setup_environment(lib_path = "/your/custom/path/to/R/libs/")
+
+
+# ============================================================================
+# 2. Data Loading
+# ============================================================================
+#' Load dataset for analysis
+#' @param file_path Path to the dataset file
+#' @param file_type Type of file ("txt", "csv", "rds", etc.)
+#' @return Loaded dataset
+load_data <- function(file_path, file_type = "txt") {
+  
+  cat("Loading dataset...\n")
+  cat(sprintf("  - File path: %s\n", file_path))
+  cat(sprintf("  - File type: %s\n", file_type))
+  
+  # Load data based on file type
+  if (file_type == "txt") {
+    data <- fread(file_path)
+  } else if (file_type == "csv") {
+    data <- fread(file_path)
+  } else if (file_type == "rds") {
+    data <- readRDS(file_path)
+  } else {
+    stop("Unsupported file type. Use 'txt', 'csv', or 'rds'")
+  }
+
+ # Convert to data.frame if needed
+  data <- as.data.frame(data)
+  
+  cat(sprintf("  - Dataset loaded: %d rows, %d columns\n", nrow(data), ncol(data)))
+  cat("Data loading complete.\n\n")
+  
+  return(data)
+}
+
+#Example for a txt file
+data <- load_data("/your/path/to/dataset.txt", "txt")
+
+
+
+# ============================================================================
+# 3. Data Preprocessing
+# ============================================================================
+#' Standardize variables for SEM analysis 
+#' @param data Input dataset
+#' @param outcome_vars Vector of outcome variable names
+#' @param mediator_vars Vector of mediator variable names (optional for Part 1)
+#' @return Dataset with standardized variables (suffix: _z)
+#' @param binary_vars Vector of binary variable names to convert to dummy (0/1)
+#' @return Dataset with prepared variables
+
+prepare_data_for_sem <- function(data, outcome_vars, mediator_vars = NULL, binary_vars = NULL) {
+  
+  cat("Preparing data for SEM analysis...\n")
+  
+  data_prep <- data
+  
+  # Step 1: Convert binary variables to dummy (0/1)
+  if (!is.null(binary_vars)) {
+    cat("Converting binary variables to dummy (0/1)...\n")
+    for (var in binary_vars) {
+      if (var %in% names(data_prep)) {
+        # Get unique values (excluding NA)
+        unique_vals <- unique(data_prep[[var]][!is.na(data_prep[[var]])])
+        
+        if (length(unique_vals) == 2) {
+          # Convert to 0/1 (alphabetically first value = 0, second = 1)
+          sorted_vals <- sort(unique_vals)
+          data_prep[[paste0(var, ".dummy")]] <- as.numeric(data_prep[[var]] == sorted_vals[2])
+          cat(sprintf("  - %s -> %s.dummy: %s=0, %s=1\n", var, var, sorted_vals[1], sorted_vals[2]))
+        } else {
+          warning(sprintf("Variable %s is not binary (has %d unique values)", var, length(unique_vals)))
+        }
+      } else {
+        warning(sprintf("Binary variable %s not found in dataset", var))
+      }
+    }
+  }
+  
+  # Step 2: Standardize outcome variables
+  if (!is.null(outcome_vars)) {
+    cat("Standardizing outcome variables...\n")
+    for (var in outcome_vars) {
+      if (var %in% names(data_prep)) {
+        new_var_name <- paste0(var, "_z")
+        data_prep[[new_var_name]] <- as.numeric(scale(data_prep[[var]]))
+        cat(sprintf("  - %s -> %s (mean=0, sd=1)\n", var, new_var_name))
+      } else {
+        warning(sprintf("Outcome variable %s not found in dataset", var))
+      }
+    }
+  }
+  
+  # Step 3: Standardize mediator variables
+  if (!is.null(mediator_vars)) {
+    cat("Standardizing mediator variables...\n")
+    for (var in mediator_vars) {
+      if (var %in% names(data_prep)) {
+        new_var_name <- paste0(var, "_z")
+        data_prep[[new_var_name]] <- as.numeric(scale(data_prep[[var]]))
+        cat(sprintf("  - %s -> %s (mean=0, sd=1)\n", var, new_var_name))
+      } else {
+        warning(sprintf("Mediator variable %s not found in dataset", var))
+      }
+    }
+  }
+  
+  cat("Data preparation complete.\n")
+  cat(sprintf("Final dataset: %d rows, %d columns\n\n", nrow(data_prep), ncol(data_prep)))
+  
+  return(data_prep)
+}
+
+#run the function with your own outcome and mediation variable names
+data_prepared <- prepare_data_for_sem(
+  data = data,
+  outcome_vars = c("outcome1","outcome2"),
+  mediator_vars = c("med1_m", "med2_f","med2_m", "med2_f"),
+  binary_vars = c("sex")
+)
+str(data_prepared)
+
+
+#' Validate dataset for SEM analysis
+#' @param data Input dataset
+#' @param required_vars Vector of required variable names
+#' @return Logical indicating if validation passed
+validate_dataset <- function(data, required_vars) {
+  cat("Validating dataset...\n")
+  # Check if all required variables exist
+  missing_vars <- required_vars[!required_vars %in% names(data)]
+  if (length(missing_vars) > 0) {
+    stop("Missing required variables: ", paste(missing_vars, collapse = ", "))
+  } else {
+    cat("  ✓ All required variables found in dataset\n")
+  }
+  
+  # Check sample size
+  n_total <- nrow(data)
+  n_complete <- nrow(data[complete.cases(data[required_vars]), ])
+  missing_percent <- round((n_total - n_complete) / n_total * 100, 1)
+  
+  cat(sprintf("  - Total sample size: %d\n", n_total))
+  cat(sprintf("  - Complete cases: %d (%.1f%%)\n", n_complete, n_complete/n_total*100))
+  cat(sprintf("  - Cases with missing data: %d (%.1f%%)\n", n_total - n_complete, missing_percent))
+  
+  # Show missing data pattern for each variable
+  cat("\n  Missing data by variable:\n")
+  for (var in required_vars) {
+    n_missing <- sum(is.na(data[[var]]))
+    percent_missing <- round(n_missing / n_total * 100, 1)
+    cat(sprintf("    %s: %d missing (%.1f%%)\n", var, n_missing, percent_missing))
+  }
+  
+  if (n_complete < 100) {
+    warning("Small complete case sample size may affect model convergence")
+  }
+  
+  if (missing_percent > 50) {
+    warning("High missing data rate (>50%) - consider FIML estimation")
+  } else if (missing_percent > 20) {
+    cat("  Note: Moderate missing data rate - FIML estimation recommended\n")
+  }
+  
+  cat("\nDataset validation complete.\n\n")
+  return(TRUE)
+}
+
+# Run dataset validation (uncomment and modify as needed)
+# Using z-standarized transmitted and non-transmitted PGS 
+# Required variables for your analysis:
+required_vars <- c("outcome", "PRS_T_MOTHER_z", "PRS_NT_MOTHER_z",
+                   "PRS_T_FATHER_z", "CPD_PRS_NT_FATHER_z", 
+                   "age", "sex")
+validate_dataset(data_prepared, required_vars)
+
+
+# ============================================================================
+# 4.  Statistical Summary and Correlation Analysis
+# ============================================================================
+#' Generate statistical summary and correlation analysis
+#' @param data Input dataset
+#' @param outcome_vars Vector of outcome variable names (both original and standardized)
+#' @param mediator_vars Vector of mediator variable names (both original and standardized, optional)
+#' @param prs_vars Vector of PRS variable names
+#' @param covariates Vector of covariate variable names
+#' @param export_tables Whether to export tables to files (default: FALSE)
+#' @param output_dir Output directory for tables (if export_tables = TRUE)
+#' @return List containing summary statistics and correlation matrices
+generate_statistical_summary <- function(data, 
+                                        outcome_vars, 
+                                        mediator_vars = NULL,
+                                        prs_vars, 
+                                        covariates,
+                                        export_tables = FALSE,
+                                        output_dir = ".") {
+  
+  cat("======================================================================\n")
+  cat("STATISTICAL SUMMARY AND CORRELATION ANALYSIS\n")
+  cat("======================================================================\n\n")
+  
+  # Combine all variables for analysis
+  all_analysis_vars <- c(outcome_vars, mediator_vars, prs_vars, covariates)
+  all_analysis_vars <- all_analysis_vars[!is.null(all_analysis_vars)]
+  
+  # Check if all variables exist
+  missing_vars <- all_analysis_vars[!all_analysis_vars %in% names(data)]
+  if (length(missing_vars) > 0) {
+    warning("Some variables not found in dataset: ", paste(missing_vars, collapse = ", "))
+    all_analysis_vars <- all_analysis_vars[all_analysis_vars %in% names(data)]
+  }
+  
+  cat(sprintf("Analyzing %d variables:\n", length(all_analysis_vars)))
+  cat(sprintf("  - Outcomes: %s\n", paste(outcome_vars, collapse = ", ")))
+  if (!is.null(mediator_vars)) {
+    cat(sprintf("  - Mediators: %s\n", paste(mediator_vars, collapse = ", ")))
+  }
+  cat(sprintf("  - PRS variables: %s\n", paste(prs_vars, collapse = ", ")))
+  cat(sprintf("  - Covariates: %s\n", paste(covariates, collapse = ", ")))
+  cat("\n")
+  
+  # 1. DESCRIPTIVE STATISTICS
+  cat("1. DESCRIPTIVE STATISTICS\n")
+  cat("==============================\n")
+  
+  desc_stats <- psych::describe(data[all_analysis_vars])
+  desc_clean <- desc_stats %>%
+    select(n, mean, sd, median, min, max, range, skew, kurtosis) %>%
+    mutate_all(~ round(.x, 3))
+  
+  print(desc_clean)
+  cat("\n")
+  
+  # 2. CORRELATION MATRICES
+  cat("2. CORRELATION ANALYSIS\n")
+  cat("=========================\n\n")
+  
+  correlation_results <- list()
+  
+  # PRS correlation
+  if (length(prs_vars) > 1) {
+    cat("2a. PRS Variables Correlation Matrix\n")
+    cat("-------------------------------------\n")
+    prs_cor <- cor(data[prs_vars], use = "pairwise.complete.obs")
+    prs_cor_rounded <- round(prs_cor, 3)
+    print(prs_cor_rounded)
+    correlation_results[["prs_correlation"]] <- prs_cor_rounded
+    cat("\n")
+  }
+  
+  # Outcomes and mediators correlation
+  if (!is.null(mediator_vars) && length(c(outcome_vars, mediator_vars)) > 1) {
+    cat("2b. Outcomes and Mediators Correlation Matrix\n")
+    cat("----------------------------------------------\n")
+    outcome_mediator_vars <- c(outcome_vars, mediator_vars)
+    out_med_cor <- cor(data[outcome_mediator_vars], use = "pairwise.complete.obs")
+    out_med_cor_rounded <- round(out_med_cor, 3)
+    print(out_med_cor_rounded)
+    correlation_results[["outcome_mediator_correlation"]] <- out_med_cor_rounded
+    cat("\n")
+  }
+  
+  # Key variables correlation
+  cat("2c. Key Variables Correlation Matrix\n")
+  cat("-------------------------------------\n")
+  key_vars <- c(outcome_vars[1:min(3, length(outcome_vars))],
+                if(!is.null(mediator_vars)) mediator_vars[1:min(4, length(mediator_vars))],
+                prs_vars)
+  full_cor <- cor(data[key_vars], use = "pairwise.complete.obs")
+  full_cor_rounded <- round(full_cor, 3)
+  print(full_cor_rounded)
+  correlation_results[["key_variables_correlation"]] <- full_cor_rounded
+  cat("\n")
+  
+  # 3. MISSING DATA SUMMARY
+  cat("3. MISSING DATA SUMMARY\n")
+  cat("=======================\n")
+  missing_summary <- data.frame(
+    Variable = all_analysis_vars,
+    N_Missing = sapply(all_analysis_vars, function(x) sum(is.na(data[[x]]))),
+    Percent_Missing = sapply(all_analysis_vars, function(x) round(sum(is.na(data[[x]])) / nrow(data) * 100, 2)),
+    stringsAsFactors = FALSE
+  )
+  missing_summary <- missing_summary[order(missing_summary$Percent_Missing, decreasing = TRUE), ]
+  print(missing_summary)
+  cat("\n")
+  
+  # Export if requested
+  if (export_tables) {
+    if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+    export_list <- list("Descriptive_Statistics" = desc_clean, "Missing_Data_Summary" = missing_summary)
+    for (i in seq_along(correlation_results)) {
+      export_list[[paste0("Correlation_", names(correlation_results)[i])]] <- correlation_results[[i]]
+    }
+    writexl::write_xlsx(export_list, file.path(output_dir, "Statistical_Summary_Tables.xlsx"))
+    cat("Tables exported to Statistical_Summary_Tables.xlsx\n")
+  }
+  
+  cat("STATISTICAL SUMMARY COMPLETE\n")
+  cat("============================\n")
+  
+  return(list(descriptive_stats = desc_clean, correlation_matrices = correlation_results, missing_data_summary = missing_summary))
+}
+
+# Generate statistical summary (modify as needed)
+dir <-"your_output_pathway"
+statistical_summary <- generate_statistical_summary(
+   data = data_prepared,
+   outcome_vars = c("outcome1", "outcome2"),
+   mediator_vars = c("med1_m", "med1_f", "med2_m", "med2_f"),
+   prs_vars = c("PRS_T_MOTHER_z", "PRS_NT_MOTHER_z", 
+               "PRS_T_FATHER_z", "PRS_NT_FATHER_z"),
+   covariates = c("age", "sex.dummy"),
+   export_tables = TRUE,
+   output_dir = dir
+ )
+
+
+
+# ============================================================================
+# 5. PART 1: Parent-of-Origin Effect (PoE) Analysis
+# ============================================================================
+#' Fit PoE SEM model with MLR and clustering
+#' @param model_syntax Character string with lavaan model syntax
+#' @param data Dataset for analysis
+#' @param cluster_var Clustering variable for robust standard errors
+#' @param estimator Estimator to use (default: "MLR")
+#' @return Fitted lavaan model object
+# =============================================================================
+# Dependencies: lavaan, dplyr, writexl (for export)
+# =============================================================================
+
+suppressPackageStartupMessages({
+  library(lavaan)
+  library(dplyr)
+  library(writexl)
+})
+
+# -----------------------------------------------------------------------------
+# 1) Model Syntax
+# -----------------------------------------------------------------------------
+#' Generate SEM model syntax for Parent-of-Origin Effects analysis 
+#' Tests direct effects of parental PRS on offspring outcomes
+#' @param outcome_var Standardized outcome variable name (e.g., "cpd_ever_z")
+#' @param prs_vars Named list: transmitted_mother, nontransmitted_mother,
+#'        transmitted_father, nontransmitted_father
+#' @param covariates Vector of covariate names (default: c("age","sex.dummy"))
+#' @return Character string with lavaan model syntax
+generate_poe_model <- function(outcome_var,
+                               prs_vars,
+                               covariates = c("age","sex.dummy")) {
+
+  # Extract PRS variable names
+  prs_t_mother <- prs_vars$transmitted_mother
+  prs_nt_mother <- prs_vars$nontransmitted_mother
+  prs_t_father <- prs_vars$transmitted_father
+  prs_nt_father <- prs_vars$nontransmitted_father
+
+  # Covariates string with labeled coefficients c1, c2, ...
+  cov_outcome <- paste(paste0("c", seq_along(covariates)), covariates, sep="*", collapse=" + ")
+
+  sprintf('
+# ============================================================================
+# PART 1: PoE Model
+#  Parental-specific effects of transmitted and non-transmitted PRS on offspring outcome
+# ============================================================================
+
+# Outcome regression
+%s ~ tm*%s + ntm*%s + tf*%s + ntf*%s + %s
+
+# Allow PRS residual covariances (genetic correlation / assortative mating)
+%s ~~ %s   # Maternal T ~~ Maternal NT
+%s ~~ %s   # Paternal T ~~ Paternal NT
+%s ~~ %s   # Maternal T ~~ Paternal T
+%s ~~ %s   # Maternal T ~~ Paternal NT
+%s ~~ %s   # Maternal NT ~~ Paternal T
+%s ~~ %s   # Maternal NT ~~ Paternal NT
+
+# ============================================================================
+# Derived parameters (named for clarity in output)
+# ============================================================================
+genetic_nurture_maternal := ntm
+genetic_nurture_paternal := ntf
+diff_genetic_nurture := ntm - ntf
+
+transmitted_maternal := tm
+transmitted_paternal := tf
+diff_transmitted_effects := tm - tf
+',
+          outcome_var, prs_t_mother, prs_nt_mother, prs_t_father, prs_nt_father, cov_outcome,
+          prs_t_mother, prs_nt_mother,
+          prs_t_father, prs_nt_father,
+          prs_t_mother, prs_t_father,
+          prs_t_mother, prs_nt_father,
+          prs_nt_mother, prs_t_father,
+          prs_nt_mother, prs_nt_father
+  )
+}
+
+# -----------------------------------------------------------------------------
+# 2) Fitting
+# -----------------------------------------------------------------------------
+# internal: decide whether to use clustering (avoid mean cluster size ~1 warning)
+.use_cluster_if_multi <- function(data, cluster_var) {
+  if (is.null(cluster_var) || !cluster_var %in% names(data)) {
+    return(list(use = FALSE, var = NULL, mean_size = NA_real_))
+  }
+  tab <- table(data[[cluster_var]])
+  mean_size <- mean(as.numeric(tab))
+  # Require >1.3 average to actually cluster (reduces 'many singletons' warnings)
+  use_cluster <- any(tab > 1) && mean_size > 1.3
+  list(use = use_cluster, var = if (use_cluster) cluster_var else NULL, mean_size = mean_size)
+}
+
+#' Fit a PoE model given lavaan syntax
+#' @param model_syntax Lavaan model character string (from generate_poe_model)
+#' @param data Data frame with variables
+#' @param cluster_var Optional clustering variable (e.g., "nuclear_fam_id")
+#' @param estimator Lavaan estimator (default "MLR")
+#' @return lavaan fitted model
+fit_poe_model <- function(model_syntax,
+                          data,
+                          cluster_var = NULL,
+                          estimator = "MLR") {
+  clu <- .use_cluster_if_multi(data, cluster_var)
+  fit <- lavaan::sem(
+    model         = model_syntax,
+    data          = data,
+    missing       = "fiml",
+    estimator     = estimator,
+    cluster       = if (isTRUE(clu$use)) clu$var else NULL,
+    fixed.x       = FALSE,   # needed so PRS ~~ PRS covariances are estimated
+    meanstructure = TRUE
+  )
+  attr(fit, "mean_cluster_size") <- clu$mean_size
+  fit
+}
+
+# -----------------------------------------------------------------------------
+# 3) Extraction
+# -----------------------------------------------------------------------------
+#' Extract coefficients, R2, and fit indices in tidy form
+#' @param fitted_model lavaan object
+#' @param outcome_var outcome name (optional; inferred if NULL)
+#' @return list with coefficients data.frame, r_squared, fit_indices, outcome
+extract_poe_parameters <- function(fitted_model, outcome_var = NULL) {
+  pe <- parameterEstimates(fitted_model, standardized = TRUE, ci = TRUE)
+  if (is.null(outcome_var)) {
+    outs <- unique(pe$lhs[pe$op == "~"])
+    outcome_var <- tail(outs, 1)
+  }
+  coef_tab <- pe[pe$op == "~" & pe$lhs == outcome_var,
+                 c("lhs","op","rhs","label","est","se","z","pvalue","ci.lower","ci.upper","std.all")]
+  rownames(coef_tab) <- NULL
+
+  r2 <- inspect(fitted_model, "r2")
+  r2_val <- if (!is.null(r2) && outcome_var %in% names(r2)) as.numeric(r2[[outcome_var]]) else NA_real_
+
+  fi_vec <- fitMeasures(fitted_model, c("chisq","df","pvalue","cfi","tli","rmsea","srmr"))
+  # Convert safely to a 1-row tibble (prevents bind_rows() glitches)
+  fit_idx <- tibble::as_tibble_row(as.list(fi_vec))
+
+  list(
+    coefficients = coef_tab,
+    r_squared    = r2_val,
+    fit_indices  = fit_idx,
+    outcome      = outcome_var
+  )
+}
+
+# -----------------------------------------------------------------------------
+# 4) Tests
+# -----------------------------------------------------------------------------
+#' Perform PoE Wald tests (tm == tf; ntm == ntf; and joint)
+#' @param fitted_model lavaan object with path labels tm, ntm, tf, ntf
+#' @return list of small data.frames for each test
+perform_poe_tests <- function(fitted_model) {
+  wald_T    <- lavTestWald(fitted_model, constraints = "tm == tf")
+  wald_NT   <- lavTestWald(fitted_model, constraints = "ntm == ntf")
+  wald_both <- lavTestWald(fitted_model, constraints = "tm == tf; ntm == ntf")
+
+  list(
+    transmitted_equal = data.frame(
+      test  = "tm == tf",
+      chisq = as.numeric(wald_T$stat),
+      df    = as.numeric(wald_T$df),
+      p     = as.numeric(wald_T$p.value)
+    ),
+    nontrans_equal = data.frame(
+      test  = "ntm == ntf",
+      chisq = as.numeric(wald_NT$stat),
+      df    = as.numeric(wald_NT$df),
+      p     = as.numeric(wald_NT$p.value)
+    ),
+    both_equal = data.frame(
+      test  = "tm==tf & ntm==ntf",
+      chisq = as.numeric(wald_both$stat),
+      df    = as.numeric(wald_both$df),
+      p     = as.numeric(wald_both$p.value)
+    )
+  )
+}
+
+#' Create compact table for tests
+create_poe_test_summary <- function(poe_tests) {
+  out <- dplyr::bind_rows(
+    poe_tests$transmitted_equal,
+    poe_tests$nontrans_equal,
+    poe_tests$both_equal
+  )
+  dplyr::mutate(out, across(where(is.numeric), ~ round(.x, 6)))
+}
+
+# -----------------------------------------------------------------------------
+# 5) Single-outcome runner
+# -----------------------------------------------------------------------------
+#' Run PoE analysis for a single outcome (first outcome in config$outcome_vars)
+#' @param data Data frame
+#' @param config List with:
+#'   - outcome_vars: vector of base names (e.g., c("cpd_ever","packyears"))
+#'   - prs_vars: list(transmitted_mother=..., nontransmitted_mother=..., transmitted_father=..., nontransmitted_father=...)
+#'   - covariates: vector (e.g., c("age","sex.dummy"))
+#'   - cluster_var: (e.g., "nuclear_fam_id")
+#'   - poe_estimator: default "MLR"
+#' @return list(model, parameters, tests, test_summary, model_syntax)
+run_poe_analysis <- function(data, config) {
+  cat(paste(rep("=", 80), collapse=""), "\n")
+  cat("PART 1: PARENT-OF-ORIGIN EFFECTS (PoE) ANALYSIS\n")
+  cat(paste(rep("=", 80), collapse=""), "\n\n")
+
+  cat("Testing direct effects of parental PRS on offspring outcomes...\n")
+  cat("Using MLR estimator with family clustering (only if multi-member clusters).\n\n")
+
+  outcome_std <- paste0(config$outcome_vars[1], "_z")
+
+  # 1) syntax
+  model_syntax <- generate_poe_model(
+    outcome_var = outcome_std,
+    prs_vars    = config$prs_vars,
+    covariates  = config$covariates
+  )
+
+  # 2) fit
+  fitted_model <- fit_poe_model(
+    model_syntax = model_syntax,
+    data         = data,
+    cluster_var  = config$cluster_var,
+    estimator    = config$poe_estimator %||% "MLR"
+  )
+
+  # 3) extract
+  poe_parameters <- extract_poe_parameters(fitted_model, outcome_var = outcome_std)
+
+  # 4) tests
+  poe_tests <- perform_poe_tests(fitted_model)
+  poe_test_summary <- create_poe_test_summary(poe_tests)
+
+  cat("Part 1 (PoE) analysis complete.\n\n")
+
+  list(
+    model        = fitted_model,
+    parameters   = poe_parameters,
+    tests        = poe_tests,
+    test_summary = poe_test_summary,
+    model_syntax = model_syntax
+  )
+}
+
+# Helper for default if NULL (like `%||%` from rlang)
+`%||%` <- function(x, y) if (is.null(x)) y else x
+
+# -----------------------------------------------------------------------------
+# 6) Mutiple-outcome Batch Runner
+# -----------------------------------------------------------------------------
+#' Run PoE analysis for multiple outcomes and optionally export .xlsx
+#' @param data Data frame
+#' @param config Same structure as run_poe_analysis()
+#' @param export logical, write xlsx
+#' @param output_dir directory for export
+#' @param file_stub base filename without extension
+#' @return list(estimates, fit, r2, wald, models)
+run_poe_analysis_batch <- function(data, config,
+                                   export = TRUE,
+                                   output_dir = ".",
+                                   file_stub = "PoE_part1_results") {
+  all_est <- list(); all_fit <- list(); all_r2 <- list(); all_wald <- list(); models <- list()
+
+  for (y in config$outcome_vars) {
+    outcome_std <- paste0(y, "_z")
+    cat(sprintf("\n--- Running PoE for outcome: %s ---\n", outcome_std))
+
+    ms <- generate_poe_model(
+      outcome_var = outcome_std,
+      prs_vars    = config$prs_vars,
+      covariates  = config$covariates
+    )
+
+    fit <- fit_poe_model(
+      model_syntax = ms,
+      data         = data,
+      cluster_var  = config$cluster_var,
+      estimator    = config$poe_estimator %||% "MLR"
+    )
+
+    ext <- extract_poe_parameters(fit, outcome_var = outcome_std)
+
+    # estimates
+    est <- dplyr::as_tibble(ext$coefficients) %>% dplyr::mutate(outcome = outcome_std)
+
+    # fit indices (already a 1-row tibble)
+    fit_idx <- ext$fit_indices %>% dplyr::mutate(outcome = outcome_std)
+
+    # R2
+    r2df <- tibble::tibble(outcome = outcome_std, r_squared = ext$r_squared)
+
+    # Wald tests
+    tests <- perform_poe_tests(fit)
+    wald_df <- dplyr::bind_rows(tests$transmitted_equal, tests$nontrans_equal, tests$both_equal) %>%
+      dplyr::mutate(outcome = outcome_std)
+
+    all_est[[outcome_std]] <- est
+    all_fit[[outcome_std]] <- fit_idx
+    all_r2[[outcome_std]]  <- r2df
+    all_wald[[outcome_std]]<- wald_df
+    models[[outcome_std]]  <- list(model = fit, syntax = ms)
+  }
+
+  estimates_df <- dplyr::bind_rows(all_est) %>%
+    dplyr::relocate(outcome) %>%
+    dplyr::mutate(across(c(est,se,z,pvalue,ci.lower,ci.upper,std.all), ~ round(.x, 6)))
+
+  fit_df <- dplyr::bind_rows(all_fit) %>% dplyr::relocate(outcome)
+  r2_df  <- dplyr::bind_rows(all_r2)
+  wald_df <- dplyr::bind_rows(all_wald) %>% dplyr::relocate(outcome) %>%
+    dplyr::mutate(across(where(is.numeric), ~ round(.x, 6)))
+
+  if (export) {
+    if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+    writexl::write_xlsx(
+      list(Estimates = estimates_df, Fit_Indices = fit_df, R2 = r2_df, Wald_Tests = wald_df),
+      file.path(output_dir, paste0(file_stub, ".xlsx"))
+    )
+    cat(sprintf("\nSaved PoE batch results to: %s\n", file.path(output_dir, paste0(file_stub, ".xlsx"))))
+  }
+
+  invisible(list(estimates = estimates_df, fit = fit_df, r2 = r2_df, wald = wald_df, models = models))
+}
+
+# =============================================================================
+# Run the functions
+# (Assumes your prepared data frame is `data_prepared` with *_z outcomes.)
+# =============================================================================
+
+# Config example 
+config <- list(
+  outcome_vars = c("outcome1","outcome2"),  # base names (function adds "_z")
+  prs_vars = list(
+    transmitted_mother     = "PRS_T_MOTHER_z",
+    nontransmitted_mother  = "PRS_NT_MOTHER_z",
+    transmitted_father     = "PRS_T_FATHER_z",
+    nontransmitted_father  = "PRS_NT_FATHER_z"
+  ),
+  covariates  = c("age","sex.dummy"),
+  cluster_var = "nuclear_fam_id",  ##replace with your own cluster variable
+  poe_estimator = "MLR"
+)
+
+# Single-outcome run (first in outcome_vars):
+poe_single <- run_poe_analysis(data = data_prepared, config = config)
+summary(poe_single$model, fit.measures = TRUE, standardized = TRUE, ci = TRUE, rsquare = TRUE)
+poe_single$parameters
+poe_single$test_summary
+
+# Multi-outcome run + export:
+out_dir <- "your_output_path"
+poe_batch <- run_poe_analysis_batch(
+  data = data_prepared, config = config,
+  export = TRUE, output_dir = out_dir,
+  file_stub = "PoE_GeneticNurture"
+)
+head(poe_batch$estimates)
